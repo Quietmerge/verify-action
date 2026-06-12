@@ -1,0 +1,164 @@
+name: "QuietMerge Verify"
+description: >-
+  Verify a Terraform/OpenTofu dependency-bump PR in YOUR CI: run terraform plan,
+  redact the result to addresses/types/actions only, and send that summary to
+  QuietMerge. Cloud credentials never leave your runner.
+branding:
+  icon: "check-circle"
+  color: "gray-dark"
+
+inputs:
+  pr_number:
+    description: "Pull request number under verification (provided by QuietMerge's dispatch)."
+    required: true
+  nonce:
+    description: "One-time verification id (provided by QuietMerge's dispatch)."
+    required: true
+  ingest_url:
+    description: "QuietMerge ingest endpoint (provided by QuietMerge's dispatch)."
+    required: true
+  ingest_token:
+    description: "Your per-repo ingest token. Pass secrets.QUIETMERGE_INGEST_TOKEN."
+    required: true
+  working_directory:
+    description: "Directory containing the Terraform root module."
+    required: false
+    default: "."
+  tf_binary:
+    description: "terraform or tofu."
+    required: false
+    default: "terraform"
+  tf_version:
+    description: "Version (or constraint) for the chosen binary."
+    required: false
+    default: "latest"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Guard — only run for an open PR this was dispatched for
+      id: guard
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        if [ "${GITHUB_EVENT_NAME}" != "workflow_dispatch" ]; then
+          echo "::error::quietmerge/verify-action only runs via workflow_dispatch."
+          exit 1
+        fi
+        pr_json="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${{ inputs.pr_number }}")"
+        state="$(jq -r .state <<<"$pr_json")"
+        head_ref="$(jq -r .head.ref <<<"$pr_json")"
+        base_ref="$(jq -r .base.ref <<<"$pr_json")"
+        if [ "$state" != "open" ] || [ "$head_ref" != "${GITHUB_REF_NAME}" ]; then
+          echo "::error::Refusing to run: PR #${{ inputs.pr_number }} is '$state' with head '$head_ref', but this run is on '${GITHUB_REF_NAME}'."
+          exit 1
+        fi
+        echo "base_ref=$base_ref" >> "$GITHUB_OUTPUT"
+
+    - name: Set up Terraform
+      if: ${{ inputs.tf_binary == 'terraform' }}
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ inputs.tf_version }}
+        terraform_wrapper: false
+
+    - name: Set up OpenTofu
+      if: ${{ inputs.tf_binary == 'tofu' }}
+      uses: opentofu/setup-opentofu@v1
+      with:
+        tofu_version: ${{ inputs.tf_version }}
+        tofu_wrapper: false
+
+    - name: Capture base-branch lock file (the "before" versions)
+      shell: bash
+      working-directory: ${{ inputs.working_directory }}
+      run: |
+        git fetch --no-tags --depth=1 origin "${{ steps.guard.outputs.base_ref }}"
+        top="$(git rev-parse --show-toplevel)"
+        rel="$(realpath --relative-to="$top" "$PWD/.terraform.lock.hcl")"
+        git show "FETCH_HEAD:$rel" > /tmp/quietmerge-lock-before.hcl 2>/dev/null \
+          || : > /tmp/quietmerge-lock-before.hcl
+
+    - name: Init
+      shell: bash
+      working-directory: ${{ inputs.working_directory }}
+      run: ${{ inputs.tf_binary }} init -input=false -upgrade -no-color
+
+    - name: Commit regenerated lock file back to the PR branch (if changed)
+      shell: bash
+      working-directory: ${{ inputs.working_directory }}
+      run: |
+        if [ -f .terraform.lock.hcl ] && ! git diff --quiet -- .terraform.lock.hcl; then
+          ${{ inputs.tf_binary }} providers lock \
+            -platform=linux_amd64 -platform=darwin_arm64
+          git config user.name "quietmerge-verify"
+          git config user.email "quietmerge-verify@users.noreply.github.com"
+          git add .terraform.lock.hcl
+          git commit -m "chore: regenerate .terraform.lock.hcl"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+          echo "Lock file regenerated and pushed; QuietMerge will re-verify the new commit."
+        fi
+
+    - name: Capture PR-branch lock file (the "after" versions)
+      shell: bash
+      working-directory: ${{ inputs.working_directory }}
+      run: |
+        cp .terraform.lock.hcl /tmp/quietmerge-lock-after.hcl 2>/dev/null \
+          || : > /tmp/quietmerge-lock-after.hcl
+
+    - name: Plan
+      id: plan
+      shell: bash
+      working-directory: ${{ inputs.working_directory }}
+      run: |
+        set +e
+        ${{ inputs.tf_binary }} plan -detailed-exitcode -input=false -no-color -out=plan.bin
+        code=$?
+        set -e
+        # -detailed-exitcode: 0 = no changes, 1 = error, 2 = changes present.
+        echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+        if [ "$code" != "1" ]; then
+          ${{ inputs.tf_binary }} show -json plan.bin > plan-full.json
+        else
+          echo '{}' > plan-full.json
+        fi
+
+    - name: Redact — only addresses, types, and actions leave this runner
+      shell: bash
+      working-directory: ${{ inputs.working_directory }}
+      run: |
+        python3 "${GITHUB_ACTION_PATH}/scripts/redact.py" \
+          --plan plan-full.json \
+          --exit-code "${{ steps.plan.outputs.exit_code }}" \
+          --tf-binary "${{ inputs.tf_binary }}" \
+          --working-directory "${{ inputs.working_directory }}" \
+          --lock-before /tmp/quietmerge-lock-before.hcl \
+          --lock-after /tmp/quietmerge-lock-after.hcl \
+          --out /tmp/quietmerge-summary.json
+        echo "Redacted summary sent to QuietMerge:"
+        cat /tmp/quietmerge-summary.json
+
+    - name: Keep the full plan as a workflow artifact (never leaves your repo)
+      uses: actions/upload-artifact@v4
+      with:
+        name: quietmerge-plan-pr-${{ inputs.pr_number }}
+        path: ${{ inputs.working_directory }}/plan-full.json
+        retention-days: 7
+
+    - name: Send redacted summary to QuietMerge (fail-soft)
+      shell: bash
+      env:
+        QUIETMERGE_INGEST_TOKEN: ${{ inputs.ingest_token }}
+      run: |
+        python3 "${GITHUB_ACTION_PATH}/scripts/ingest_post.py" \
+          --summary /tmp/quietmerge-summary.json \
+          --nonce "${{ inputs.nonce }}" \
+          --url "${{ inputs.ingest_url }}"
+
+    - name: Fail the job if the plan itself errored
+      if: ${{ steps.plan.outputs.exit_code == '1' }}
+      shell: bash
+      run: |
+        echo "::error::terraform plan exited 1 — see the Plan step above."
+        exit 1

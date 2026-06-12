@@ -1,0 +1,65 @@
+# QuietMerge verification workflow.
+#
+# Save as .github/workflows/quietmerge-verify.yml — the filename matters,
+# QuietMerge dispatches this exact workflow. Add your cloud auth step where
+# marked. Your credentials are used only inside this run and are never sent
+# to QuietMerge.
+#
+# Why workflow_dispatch and not `on: pull_request`? Workflows triggered by
+# Dependabot/Renovate PRs run with restricted permissions and WITHOUT your
+# repo secrets — a well-known trap. QuietMerge instead dispatches this
+# workflow on the PR branch, where it has normal secret/OIDC access.
+
+name: quietmerge-verify
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number under verification"
+        required: true
+      nonce:
+        description: "One-time verification id from QuietMerge"
+        required: true
+      ingest_url:
+        description: "QuietMerge ingest endpoint"
+        required: true
+      working_directory:
+        description: "Terraform root module directory"
+        required: false
+        default: "."
+      tf_binary:
+        description: "terraform or tofu"
+        required: false
+        default: "terraform"
+      tf_version:
+        description: "Version (or constraint) for the chosen binary"
+        required: false
+        default: "latest"
+
+permissions:
+  contents: write      # checkout + lock-file fix-up commits
+  pull-requests: read  # the action verifies the PR is open before running
+  id-token: write      # cloud OIDC auth (recommended over static keys)
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # >>> YOUR cloud auth goes here (OIDC recommended). Example for AWS:
+      # - uses: aws-actions/configure-aws-credentials@v4
+      #   with:
+      #     role-to-assume: arn:aws:iam::123456789012:role/terraform-plan-readonly
+      #     aws-region: eu-west-2
+
+      - uses: quietmerge/verify-action@v1
+        with:
+          pr_number: ${{ inputs.pr_number }}
+          nonce: ${{ inputs.nonce }}
+          ingest_url: ${{ inputs.ingest_url }}
+          working_directory: ${{ inputs.working_directory }}
+          tf_binary: ${{ inputs.tf_binary }}
+          tf_version: ${{ inputs.tf_version }}
+          ingest_token: ${{ secrets.QUIETMERGE_INGEST_TOKEN }}
